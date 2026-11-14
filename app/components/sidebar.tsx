@@ -178,6 +178,21 @@ export function Sidebar({
             Team
           </NavLink>
         )}
+        {process.env.NODE_ENV !== "production" && (
+          <NavLink
+            to="/prototype/knock"
+            className={({ isActive }) =>
+              cn(
+                "mt-2 flex items-center gap-2 rounded-md border border-dashed border-amber-500/50 px-3 py-2 text-xs font-semibold text-amber-700 transition-colors dark:text-amber-300",
+                isActive
+                  ? "bg-amber-500/20"
+                  : "bg-amber-500/5 hover:bg-amber-500/15"
+              )
+            }
+          >
+            [PROTOTYPE] Knock Spike
+          </NavLink>
+        )}
       </nav>
 
       {recentCourses.length > 0 && (

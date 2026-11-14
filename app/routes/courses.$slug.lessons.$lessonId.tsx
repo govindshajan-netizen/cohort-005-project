@@ -55,6 +55,7 @@ import { data, isRouteErrorResponse } from "react-router";
 import { z } from "zod";
 import { COUNTRIES } from "~/lib/ppp";
 import { parseFormData, parseParams } from "~/lib/validation";
+import { triggerDiscussionReplyPrototype } from "~/lib/knock-prototype.server";
 
 const lessonParamsSchema = z.object({
   slug: z.string().min(1),
@@ -900,12 +901,31 @@ export async function action({ params, request }: Route.ActionArgs) {
         if (!parsed.success) {
           return { ok: false, error: "Enter a comment before posting." };
         }
-        createComment(
+        const created = createComment(
           currentUserId,
           lessonId,
           parsed.data.parentId ?? null,
           parsed.data.body
         );
+        if (parsed.data.parentId != null) {
+          const parentComment = getCommentById(parsed.data.parentId);
+          if (parentComment && parentComment.userId !== currentUserId) {
+            const actor = getUserById(currentUserId);
+            const recipient = getUserById(parentComment.userId);
+            const lesson = getLessonById(lessonId);
+            if (actor && recipient && lesson) {
+              await triggerDiscussionReplyPrototype({
+                actor,
+                recipient,
+                courseTitle: course.title,
+                courseSlug: course.slug,
+                lessonId: lesson.id,
+                lessonTitle: lesson.title,
+                replyExcerpt: created.body,
+              }).catch(() => null);
+            }
+          }
+        }
         return { ok: true };
       }
 
