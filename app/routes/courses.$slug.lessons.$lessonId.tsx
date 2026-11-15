@@ -10,6 +10,13 @@ import {
   deleteComment,
   editComment,
 } from "~/lib/comments.server";
+import {
+  getNoteForLesson,
+  isBookmarked,
+  saveNote,
+  toggleBookmark,
+} from "~/lib/bookmarks-and-notes.server";
+import { MAX_NOTE_LENGTH, MIN_NOTE_LENGTH } from "~/lib/notes";
 import { defaultNotifications } from "~/lib/notifications.server";
 import {
   CommentThread,
@@ -36,6 +43,7 @@ import {
 import { and, asc, desc, eq, or, sql } from "drizzle-orm";
 import { Button } from "~/components/ui/button";
 import { Card, CardContent } from "~/components/ui/card";
+import { Textarea } from "~/components/ui/textarea";
 import {
   AlertTriangle,
   CheckCircle2,
@@ -44,8 +52,11 @@ import {
   ChevronRight,
   Circle,
   Clock,
+  Bookmark,
+  BookmarkCheck,
   Github,
   HelpCircle,
+  NotebookPen,
   MapPin,
   PlayCircle,
   ShieldAlert,
@@ -53,7 +64,7 @@ import {
   Trophy,
   RotateCcw,
 } from "lucide-react";
-import { cn, formatDuration } from "~/lib/utils";
+import { cn, formatDuration, formatRelativeTime } from "~/lib/utils";
 import { renderMarkdown } from "~/lib/markdown.server";
 import { YouTubePlayer } from "~/components/youtube-player";
 import { data, isRouteErrorResponse } from "react-router";
@@ -80,6 +91,22 @@ const editCommentSchema = z.object({
   intent: z.literal("edit-comment"),
   commentId: z.coerce.number().int(),
   body: z.string(),
+});
+
+const toggleBookmarkSchema = z.object({
+  intent: z.literal("toggle-bookmark"),
+});
+
+const saveNoteSchema = z.object({
+  intent: z.literal("save-note"),
+  body: z
+    .string()
+    .trim()
+    .min(MIN_NOTE_LENGTH, "Note cannot be empty.")
+    .max(
+      MAX_NOTE_LENGTH,
+      `Note must be ${MAX_NOTE_LENGTH.toLocaleString("en-US")} characters or fewer.`
+    ),
 });
 
 const deleteCommentSchema = z.object({
@@ -689,6 +716,17 @@ export async function loader({ params, request }: Route.LoaderArgs) {
     ? await renderThread(getLessonThread(lessonId))
     : [];
 
+  // The Student's own Bookmark and Note for this Lesson, gated on content
+  // access so signed-out and unenrolled visitors receive neither.
+  const bookmarked =
+    canViewContent && currentUserId !== null
+      ? isBookmarked(db, currentUserId, lessonId)
+      : false;
+  const note =
+    canViewContent && currentUserId !== null
+      ? getNoteForLesson(db, currentUserId, lessonId)
+      : null;
+
   // Render lesson content from Markdown to HTML server-side
   const contentHtml = lesson.content
     ? await renderMarkdown(lesson.content)
@@ -783,6 +821,10 @@ export async function loader({ params, request }: Route.LoaderArgs) {
     canViewContent,
     canModerate: access.isStaff,
     instructorName: instructor?.name ?? "your instructor",
+    bookmarked,
+    note: note
+      ? { body: note.body, updatedAt: note.updatedAt }
+      : null,
   };
 }
 
@@ -880,6 +922,52 @@ export async function action({ params, request }: Route.ActionArgs) {
     }
   }
 
+  if (intent === "toggle-bookmark" || intent === "save-note") {
+    await requireContentAccess(request, course.id);
+
+    const lesson = getLessonById(lessonId);
+    if (!lesson) {
+      throw data("Lesson not found", { status: 404 });
+    }
+    const mod = getModuleById(lesson.moduleId);
+    if (!mod || mod.courseId !== course.id) {
+      throw data("Lesson not found in this course", { status: 404 });
+    }
+
+    if (intent === "toggle-bookmark") {
+      const parsed = parseFormData(formData, toggleBookmarkSchema);
+      if (!parsed.success) {
+        throw data("Invalid bookmark request", { status: 400 });
+      }
+      const toggled = toggleBookmark(db, currentUserId, lessonId, new Date());
+      if (!toggled.ok) {
+        throw data(toggled.error, { status: 404 });
+      }
+      return { ok: true, bookmarked: toggled.bookmarked };
+    }
+
+    const parsed = parseFormData(formData, saveNoteSchema);
+    if (!parsed.success) {
+      return {
+        ok: false,
+        error: parsed.errors.body ?? "Could not save note.",
+      };
+    }
+
+    const saved = saveNote(
+      db,
+      currentUserId,
+      lessonId,
+      parsed.data.body,
+      new Date()
+    );
+    if (!saved.ok) {
+      return { ok: false, error: saved.error };
+    }
+
+    return { ok: true, noteSaved: true };
+  }
+
   if (intent === "mark-complete") {
     markLessonComplete(currentUserId, lessonId);
     return { success: true };
@@ -966,6 +1054,8 @@ export default function LessonViewer({ loaderData }: Route.ComponentProps) {
     canViewContent,
     canModerate,
     instructorName,
+    bookmarked,
+    note,
   } = loaderData;
   const [autoplay, toggleAutoplay] = useAutoplay();
   const fetcher = useFetcher({ key: `mark-complete-${lesson.id}` });
@@ -1066,27 +1156,37 @@ export default function LessonViewer({ loaderData }: Route.ComponentProps) {
 
         <div className="mx-auto max-w-4xl">
           {/* Lesson Title */}
-          <h1 className="mb-2 text-3xl font-bold">{lesson.title}</h1>
-          <div className="mb-6 flex items-center gap-3">
-            {lesson.durationMinutes && (
-              <div className="flex items-center gap-1 text-sm text-muted-foreground">
-                <Clock className="size-4" />
-                {formatDuration(lesson.durationMinutes, true, false, false)}
-              </div>
-            )}
-            {lesson.githubRepoUrl && (
-              <a
-                href={lesson.githubRepoUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                <Button variant="outline" size="sm">
-                  <Github className="mr-1.5 size-4" />
-                  Open Code
-                </Button>
-              </a>
+          <div className="mb-2 flex items-start justify-between gap-4">
+            <h1 className="text-3xl font-bold">{lesson.title}</h1>
+            {canViewContent && currentUserId !== null && (
+              <BookmarkToggle bookmarked={bookmarked} />
             )}
           </div>
+          {(lesson.durationMinutes || lesson.githubRepoUrl) && (
+            <div className="mb-6 flex items-center gap-3">
+              {lesson.durationMinutes && (
+                <div className="flex items-center gap-1 text-sm text-muted-foreground">
+                  <Clock className="size-4" />
+                  {formatDuration(lesson.durationMinutes, true, false, false)}
+                </div>
+              )}
+              {lesson.githubRepoUrl && (
+                <a
+                  href={lesson.githubRepoUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  <Button variant="outline" size="sm">
+                    <Github className="mr-1.5 size-4" />
+                    Open Code
+                  </Button>
+                </a>
+              )}
+            </div>
+          )}
+          {!lesson.durationMinutes && !lesson.githubRepoUrl && (
+            <div className="mb-4" />
+          )}
 
           {/* YouTube Video */}
           {lesson.videoUrl && (
@@ -1101,6 +1201,11 @@ export default function LessonViewer({ loaderData }: Route.ComponentProps) {
               autoplay={autoplay}
               onToggleAutoplay={toggleAutoplay}
             />
+          )}
+
+          {/* Notes */}
+          {canViewContent && currentUserId !== null && (
+            <LessonNote key={lesson.id} note={note} />
           )}
 
           {/* Lesson Content */}
@@ -1237,6 +1342,76 @@ export default function LessonViewer({ loaderData }: Route.ComponentProps) {
         </div>
       </div>
     </div>
+  );
+}
+
+function BookmarkToggle({ bookmarked }: { bookmarked: boolean }) {
+  const fetcher = useFetcher<{ ok: boolean; bookmarked?: boolean }>();
+  const isToggling =
+    fetcher.state !== "idle" &&
+    fetcher.formData?.get("intent") === "toggle-bookmark";
+  const displayedBookmarked = isToggling ? !bookmarked : bookmarked;
+
+  return (
+    <fetcher.Form method="post">
+      <input type="hidden" name="intent" value="toggle-bookmark" />
+      <Button type="submit" variant="outline" size="sm" disabled={isToggling}>
+        {displayedBookmarked ? (
+          <BookmarkCheck className="mr-1.5 size-4" />
+        ) : (
+          <Bookmark className="mr-1.5 size-4" />
+        )}
+        {displayedBookmarked ? "Bookmarked" : "Bookmark"}
+      </Button>
+    </fetcher.Form>
+  );
+}
+
+function LessonNote({
+  note,
+}: {
+  note: { body: string; updatedAt: string } | null;
+}) {
+  const fetcher = useFetcher<{ ok: boolean; error?: string }>();
+  const isSaving = fetcher.state !== "idle";
+  const error = fetcher.data?.ok === false ? fetcher.data.error : undefined;
+
+  return (
+    <Card className="mb-8">
+      <CardContent className="space-y-3 pt-6">
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <NotebookPen className="size-4 text-muted-foreground" />
+            <h2 className="font-semibold">Your note</h2>
+          </div>
+          {note && (
+            <span
+              suppressHydrationWarning
+              className="text-xs text-muted-foreground"
+            >
+              Last edited {formatRelativeTime(note.updatedAt)}
+            </span>
+          )}
+        </div>
+
+        <fetcher.Form method="post" className="space-y-3">
+          <input type="hidden" name="intent" value="save-note" />
+          <Textarea
+            name="body"
+            rows={6}
+            defaultValue={note?.body ?? ""}
+            placeholder="Only you can read this."
+            className="resize-y"
+          />
+          <div className="flex items-center gap-3">
+            <Button type="submit" size="sm" disabled={isSaving}>
+              {isSaving ? "Saving..." : "Save note"}
+            </Button>
+            {error && <span className="text-sm text-red-600">{error}</span>}
+          </div>
+        </fetcher.Form>
+      </CardContent>
+    </Card>
   );
 }
 
